@@ -7,6 +7,7 @@
 #        fm-control.sh <task-id> relaunch [--harness <name>] [--model <name>]
 #                                         [--effort <level>]
 #                                         (--note <text> | --note-file <path>)
+#        fm-control.sh <task-id> migrate
 #
 # Why this exists, and how it differs from fm-send.sh. bin/fm-send.sh is the
 # DATA plane: conversational text for the agent to read, always routing-marked
@@ -52,6 +53,14 @@
 #              the prior durable record in place and reports the concrete
 #              state; it never leaves a half-transitioned task claiming to be
 #              running.
+#   migrate    Move a stopped task from its current backend (cmux, zellij, or
+#              orca) onto Herdr, preserving the worktree, uncommitted work,
+#              and instructions. The migration checkpoints the old meta before
+#              any change, creates the new Herdr endpoint, verifies it is live
+#              and agent-free, then atomically replaces the meta. Failed
+#              migrations restore the checkpoint so the prior state is always
+#              recoverable. The backend must have a recovery-grade agent-state
+#              classifier to prove the old endpoint is dead.
 #
 # Teardown and discard are NOT verbs here and never will be. `exit` stops an
 # agent and preserves everything else; removing a worktree, killing an
@@ -78,10 +87,10 @@
 #     is refused rather than guessed at.
 #   - A backend that cannot deliver the harness's interrupt key is refused
 #     (Orca's terminal API has no Escape).
-#   - `exit` and `relaunch` require a backend with a recovery-grade agent-state
-#     classifier (tmux, herdr), because without one the "the agent stopped"
-#     postcondition cannot be proven. zellij, orca, and cmux are refused rather
-#     than reported as successful blind.
+#   - `exit`, `relaunch`, and `migrate` require a backend with a recovery-grade
+#     agent-state classifier (tmux, herdr), because without one the "the agent
+#     stopped" postcondition cannot be proven. zellij, orca, and cmux are
+#     refused rather than reported as successful blind.
 #   - An ambiguous or unreadable endpoint state refuses; only a positively
 #     classified state acts.
 #
@@ -876,5 +885,10 @@ case "$VERB" in
     ;;
   relaunch)
     do_relaunch
+    ;;
+  migrate)
+    # Validate that migration is allowed on this backend.
+    require_state_verified_backend migrate
+    "$SCRIPT_DIR/fm-backend-migration.sh" "$ID"
     ;;
 esac
