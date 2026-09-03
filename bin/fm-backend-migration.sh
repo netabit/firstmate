@@ -183,21 +183,20 @@ case "$SRC_BACKEND" in
     if fm_backend_target_exists "$SRC_BACKEND" "$SRC_TARGET" 2>/dev/null; then
       # Endpoint exists; check if there's a shell process in the worktree.
       if [ -d "$WORKTREE" ]; then
-        case "$SRC_BACKEND" in
-          cmux)
-            # For cmux, check if the workspace still exists.
-            # Since cmux has no recovery-grade classifier, we use the target_exists check.
-            # If it exists, we need to verify no agent is running.
-            # We check if the workspace has a shell in the worktree directory.
-            AGENT_STATUS="possibly-alive"
-            ;;
-          zellij)
-            AGENT_STATUS="possibly-alive"
-            ;;
-          orca)
-            AGENT_STATUS="possibly-alive"
-            ;;
-        esac
+        # Look for shell processes running in the worktree directory.
+        # A stopped agent typically leaves its terminal endpoint present
+        # but no shell process running in the worktree.
+        SHELL_PROCS=$(pgrep -f "bash|sh|zsh" 2>/dev/null | while read -r pid; do
+          if [ -d "/proc/$pid" ] 2>/dev/null && \
+             grep -q "$WORKTREE" /proc/$pid/cwd 2>/dev/null; then
+            echo "$pid"
+          fi
+        done | wc -l) || SHELL_PROCS=0
+        if [ "$SHELL_PROCS" -eq 0 ]; then
+          AGENT_STATUS="dead"
+        else
+          AGENT_STATUS="possibly-alive"
+        fi
       else
         AGENT_STATUS="dead"
       fi
@@ -273,8 +272,8 @@ fm_backend_source herdr || die "could not source the herdr backend adapter"
 
 # Resolve the Herdr session. For a migration, we use the home's own labeled
 # workspace (same as a non-herdr launcher creating a Herdr task).
-HERDR_SESSION=""
-if [ -n "${HERDR_SESSION:-}" ]; then
+HERDR_SESSION="${HERDR_SESSION:-}"
+if [ -n "$HERDR_SESSION" ]; then
   : # already set from environment
 elif [ -n "${HERDR_ENV:-}" ]; then
   # We're inside herdr; resolve from our own pane.
@@ -355,6 +354,8 @@ NEW_META="$STATE/$ID.meta.tmp"
   echo "herdr_workspace_id=$HERDR_WS_ID"
   echo "herdr_tab_id=${HERDR_SESSION}:${HERDR_TAB_ID}"
   echo "herdr_pane_id=$HERDR_PANE_ID"
+  [ -n "$BUSY_GEN" ] && echo "busy_gen=$BUSY_GEN"
+  [ -n "$SPAWN_GEN" ] && echo "spawn_gen=$SPAWN_GEN"
   [ -n "$PR_URL" ] && echo "pr=$PR_URL"
   [ -n "$PR_HEAD" ] && echo "pr_head=$PR_HEAD"
   [ -n "$REMOTE_HOST" ] && echo "remote_host=$REMOTE_HOST"

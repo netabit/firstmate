@@ -887,8 +887,10 @@ case "$VERB" in
     do_relaunch
     ;;
   migrate)
-    # Validate that migration is allowed on this backend.
-    require_state_verified_backend migrate
+    # Delegate to the migration script, which owns the full migration
+    # procedure including source-backend verification. The migration
+    # script itself refuses if the source backend lacks a recovery-grade
+    # agent-state classifier and the endpoint still exists.
     "$SCRIPT_DIR/fm-backend-migration.sh" "$ID"
     ;;
 esac

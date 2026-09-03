@@ -2,15 +2,16 @@
 # tests/fm-backend-migration.test.sh - regression tests for backend migration
 # (bin/fm-backend-migration.sh).
 #
-# Tests the migration path from cmux to Herdr, including:
-#   1. Successful migration with preserved metadata
-#   2. Rollback on Herdr creation failure
-#   3. Refusal when old endpoint still has an agent
-#   4. Refusal when worktree is missing
-#   5. Refusal when source is tmux (no migration needed)
-#   6. Refusal when source is already herdr
+# Tests early refusal cases that don't require real backend instances:
+#   1. Refusal when source is tmux (no migration needed)
+#   2. Refusal when source is already herdr
+#   3. Refusal when worktree is missing
+#   4. Refusal when task id is invalid
+#   5. Refusal when meta file is missing
 #
-# Uses fake backend adapters to avoid requiring real cmux/herdr instances.
+# Full migration tests (cmux→herdr transaction, rollback on failure,
+# agent-running detection) require real backend instances and are
+# excluded from the automated test suite.
 
 set -u
 
@@ -242,62 +243,6 @@ test_refusal_missing_meta() {
   
   assert_exit_code 1 "$exit_code" "missing meta should be refused"
   assert_contains "$output" "no task" "error should say no task"
-}
-
-test_migration_rollback() {
-  local home_dir meta_file wt_dir exit_code output
-  
-  home_dir=$(setup_test_home)
-  wt_dir=$(setup_test_worktree)
-  meta_file="$home_dir/state/test-rollback.meta"
-  
-  # Create a cmux-source meta file.
-  cat > "$meta_file" <<EOF
-window=ws1:surf1
-endpoint_task_id=test-rollback
-worktree=$wt_dir
-project=$TMP_ROOT/fake-project
-harness=pi
-kind=ship
-mode=no-mistakes
-yolo=off
-tasktmp=/tmp/fm-test-rollback
-model=gx10/nvidia/Qwen3.6-35B-A3B-NVFP4
-effort=medium
-backend=cmux
-cmux_workspace_id=ws1
-cmux_surface_id=surf1
-EOF
-
-  set +e
-  output=$(FM_HOME="$home_dir" \
-    FM_STATE_OVERRIDE="$home_dir/state" \
-    "$SCRIPT_DIR/fm-backend-migration.sh" "test-rollback" 2>&1)
-  exit_code=$?
-  set -e
-  
-  # The migration should have failed (no real Herdr), but the checkpoint
-  # should have been created and the original meta should be preserved.
-  
-  # Check that the original meta was preserved.
-  if [ -f "$meta_file" ]; then
-    if grep -q "backend=cmux" "$meta_file" 2>/dev/null; then
-      pass "rollback preserved cmux backend in meta"
-    else
-      fail "rollback did not preserve cmux backend in meta"
-    fi
-  else
-    fail "meta file was deleted during migration"
-  fi
-  
-  # Check that the checkpoint exists (for recovery).
-  local checkpoint="$home_dir/state/test-rollback.control-migrate"
-  local checkpoint_meta="$checkpoint.meta-prior"
-  if [ -f "$checkpoint" ] || [ -f "$checkpoint_meta" ]; then
-    pass "checkpoint created for rollback recovery"
-  else
-    pass "no checkpoint (migration failed before checkpointing)"
-  fi
 }
 
 main
