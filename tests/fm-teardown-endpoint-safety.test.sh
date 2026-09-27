@@ -550,6 +550,80 @@ test_reused_pool_slot_refuses_before_touching_the_other_task() {
   pass "fm-teardown: a pool slot named by a second task record is never returned, killed, or reset"
 }
 
+# Two records can name one slot after reuse. Only the slot's positive claim
+# distinguishes the stale record from its current owner; an absent or unsafe
+# claim never licenses either record to release the contested slot.
+test_shared_slot_claim_distinguishes_stale_from_current_owner() {
+  local dir id=stale-task other=current-task scenario target rc
+  for scenario in stale current absent unsafe; do
+    dir=$(make_case "shared-slot-$scenario")
+    mark_case_as_treehouse_pool "$dir"
+    fm_write_meta "$dir/home/state/$id.meta" \
+      "window=firstmate:fm-$id" "endpoint_task_id=$id" \
+      "worktree=$dir/worktree" "project=$dir/project" "kind=scout"
+    fm_write_meta "$dir/home/state/$other.meta" \
+      "window=firstmate:fm-$other" "endpoint_task_id=$other" \
+      "worktree=$dir/worktree" "project=$dir/project" "kind=scout"
+    target=$id
+    case "$scenario" in
+      stale) claim_pool_slot "$dir" "$other" ;;
+      current) claim_pool_slot "$dir" "$other"; target=$other ;;
+      absent) ;;
+      unsafe) printf 'not-a-claim\n' > "$dir/pool/1/.fm-slot-owner" ;;
+    esac
+
+    set +e
+    run_case "$dir" "$target" > "$dir/stdout" 2> "$dir/stderr"
+    rc=$?
+    set -e
+    if [ "$scenario" = stale ]; then
+      [ "$rc" -eq 0 ] || fail "stale record could not finish its own cleanup: $(cat "$dir/stderr")"
+      assert_reassigned_slot_left_alone "$dir" "$id" "$other" "shared-slot stale record"
+      assert_present "$dir/home/state/$other.meta" "stale cleanup removed the current owner's record"
+      assert_present "$dir/worktree/sentinel" "stale cleanup changed the current owner's copy"
+      assert_contains "$(cat "$dir/runtime.log")" "fm-$id" \
+        "stale cleanup did not close its own endpoint"
+      ! grep -F "kill-window" "$dir/runtime.log" | grep -Fq "fm-$other" \
+        || fail "stale cleanup closed the current owner's endpoint: $(cat "$dir/runtime.log")"
+    else
+      [ "$rc" -ne 0 ] || fail "contested slot with $scenario claim was returned"
+      assert_present "$dir/home/state/$id.meta" "refusal erased the stale task record"
+      assert_present "$dir/home/state/$other.meta" "refusal erased the current task record"
+      assert_present "$dir/worktree/sentinel" "refusal changed the contested copy"
+      [ ! -s "$dir/runtime.log" ] \
+        || fail "contested slot with $scenario claim reached the runtime: $(cat "$dir/runtime.log")"
+      if [ "$scenario" = unsafe ]; then
+        assert_contains "$(cat "$dir/stderr")" "$dir/pool/1/.fm-slot-owner" \
+          "unsafe claim refusal did not identify its file"
+      else
+        assert_contains "$(cat "$dir/stderr")" "$other" \
+          "contested slot refusal did not name the other record"
+      fi
+    fi
+  done
+
+  # Ordinary cleanup of a completed ship must skip the current owner's dirty
+  # slot even without --force; the two task records still name the same copy.
+  dir=$(make_case shared-slot-completed-ships)
+  mark_case_as_treehouse_pool "$dir"
+  fm_write_meta "$dir/home/state/$id.meta" \
+    "window=firstmate:fm-$id" "endpoint_task_id=$id" \
+    "worktree=$dir/worktree" "project=$dir/project" "kind=ship"
+  fm_write_meta "$dir/home/state/$other.meta" \
+    "window=firstmate:fm-$other" "endpoint_task_id=$other" \
+    "worktree=$dir/worktree" "project=$dir/project" "kind=ship"
+  claim_pool_slot "$dir" "$other"
+  FM_HOME="$dir/home" FM_ROOT_OVERRIDE="$ROOT" \
+    FM_RUNTIME_LOG="$dir/runtime.log" PATH="$dir/fakebin:$PATH" \
+    "$TEARDOWN" "$id" > "$dir/stdout" 2> "$dir/stderr" \
+    || fail "completed ship's stale record could not clean up without --force: $(cat "$dir/stderr")"
+  assert_reassigned_slot_left_alone "$dir" "$id" "$other" "completed ship without --force"
+  assert_present "$dir/home/state/$other.meta" "completed ship cleanup removed the current task record"
+  assert_present "$dir/worktree/sentinel" "completed ship cleanup changed the current owner's dirty copy"
+
+  pass "fm-teardown: a positive other-task claim cleans only the stale record; current, absent and unsafe claims cannot release a contested slot"
+}
+
 test_cross_home_pool_slot_collision_refuses() {
   local dir id=stale-task other=secondmate-task second_home second_project rc
   dir=$(make_case slot-reuse-cross-home)
@@ -1400,6 +1474,7 @@ test_orca_close_failure_refuses_even_under_force
 test_already_gone_endpoint_still_completes_without_a_refusal
 test_bare_relative_origin_shares_project_lock_with_clone
 test_reused_pool_slot_refuses_before_touching_the_other_task
+test_shared_slot_claim_distinguishes_stale_from_current_owner
 test_cross_home_pool_slot_collision_refuses
 test_sole_slot_record_still_tears_down
 test_reassigned_pool_slot_finishes_own_cleanup_without_touching_the_slot
