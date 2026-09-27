@@ -136,7 +136,7 @@ FM_HOME="$CHILD_HOME" "$TOOL" admit --model "$MODEL" --max 1 --task child-race -
 race_b=$!
 wait "$race_a" || fail "parent capacity admission failed"
 wait "$race_b" || fail "child capacity admission failed"
-admitted=$(grep -h '  status: admitted' "$TMP_ROOT/cross-home-burst"/* | wc -l | tr -d ' ')
+admitted=$(grep -hc '  status: admitted' "$TMP_ROOT/cross-home-burst"/* | awk '{ total += $1 } END { print total + 0 }')
 [ "$admitted" = 1 ] || fail "cross-home concurrent admissions accepted $admitted, want 1"
 rm -f "$HOME_DIR/data/secondmates.md"
 rm -rf "$CHILD_HOME"
@@ -177,8 +177,8 @@ done
 for pid in $burst_pids; do
   wait "$pid" || fail "a concurrent admit exited nonzero"
 done
-admitted=$(grep -h '  status: admitted' "$TMP_ROOT/burst"/* | wc -l | tr -d ' ')
-full=$(grep -h '  status: full' "$TMP_ROOT/burst"/* | wc -l | tr -d ' ')
+admitted=$(grep -hc '  status: admitted' "$TMP_ROOT/burst"/* | awk '{ total += $1 } END { print total + 0 }')
+full=$(grep -hc '  status: full' "$TMP_ROOT/burst"/* | awk '{ total += $1 } END { print total + 0 }')
 claims=$(find "$STATE_DIR/local-capacity.d" -type f ! -name '.*' | wc -l | tr -d ' ')
 [ "$admitted" = 3 ] || fail "concurrent admits accepted $admitted, want 3"
 [ "$full" = 5 ] || fail "concurrent admits refused $full, want 5"

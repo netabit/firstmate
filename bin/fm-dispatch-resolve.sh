@@ -366,7 +366,8 @@ fm_quota_json_valid < "$QUOTA" || emit_error "quota-axi --json returned an inval
 CAPACITY_JSON='{}'
 while IFS= read -r local_model; do
   [ -n "$local_model" ] || continue
-  cap_out=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="${FM_STATE_OVERRIDE:-$FM_HOME/state}" FM_CONFIG_OVERRIDE="$CONFIG" \
+  capacity_state=${FM_STATE_OVERRIDE:-$FM_HOME/state}
+  cap_out=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$capacity_state" FM_CONFIG_OVERRIDE="$CONFIG" \
     "$SCRIPT_DIR/fm-local-capacity.sh" count --model "$local_model" 2>/dev/null) || cap_out=''
   cap_status=$(printf '%s\n' "$cap_out" | awk '/^  status: / { sub(/^  status: /, ""); print; exit }')
   cap_active=$(printf '%s\n' "$cap_out" | awk '/^  active: / { sub(/^  active: /, ""); print; exit }')
