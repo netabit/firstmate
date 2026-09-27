@@ -6,7 +6,7 @@
 # bound. Most cases pin the perl watchdog, the preferred mechanism and the only
 # one a stock macOS host has, under a PATH that holds no timeout variant; the
 # GNU fallback case runs only where a real timeout exists.
-# shellcheck disable=SC2016 # each bounded bash -c script expands its own arguments
+# shellcheck disable=SC2016,SC2026 # bounded scripts contain intentional nested shell quoting
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -109,7 +109,7 @@ test_the_bound_replaces_the_calling_shell() {
     rm -f "$dir/caller" "$dir/parent"
     (
       . "$ROOT/bin/fm-timeout-lib.sh"
-      printf '%s\n' "$BASHPID" > "$dir/caller"
+      sh -c 'printf "%s\\n" "$PPID"' > "$dir/caller"
       PATH=$path fm_exec_timed 5 1 bash -c 'echo "$PPID" > "$1"' _ "$dir/parent"
     ) || fail "the bounded probe failed under PATH=$path"
     caller=$(cat "$dir/caller")
@@ -183,11 +183,13 @@ test_a_named_owner_that_is_gone_ends_the_command() {
   sleep 0 &
   gone=$!
   wait "$gone" 2>/dev/null || true
+  gone=99999999
   started=$SECONDS
   (
     . "$ROOT/bin/fm-timeout-lib.sh"
-    PATH=$PERL_ONLY FM_EXEC_TIMED_OWNER_PID=$gone \
-      fm_exec_timed 60 1 bash -c 'echo $$ > "$1"; exec sleep 300' _ "$dir/pid"
+    PATH=$PERL_ONLY
+    export FM_EXEC_TIMED_OWNER_PID=$gone
+    fm_exec_timed 60 1 bash -c 'echo $$ > "$1"; exec sleep 300' _ "$dir/pid"
   ) || rc=$?
   elapsed=$((SECONDS - started))
   [ "$elapsed" -lt 15 ] || fail "a watchdog whose named owner was gone ran to its bound (${elapsed}s)"
@@ -211,10 +213,10 @@ test_an_owner_that_dies_during_startup_ends_the_command() {
   PATH=$PERL_ONLY bash -c '
     . "$1/bin/fm-timeout-lib.sh"
     (
-      echo "$BASHPID" > "$2/watchdog"
       while kill -0 "$$" 2>/dev/null; do sleep 0.05; done
       fm_exec_timed 60 1 bash -c "exec sleep 300"
     ) >/dev/null 2>&1 &
+    echo "$!" > "$2/watchdog"
     exit 0
   ' _ "$ROOT" "$dir"
   wait_for_file "$dir/watchdog"
