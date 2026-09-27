@@ -60,6 +60,9 @@ For each candidate, preserve explicit `harness`, `model`, and `provider`; `harne
 Apply the three cheap orthogonal gates first.
 `spendPriority` ranks only among candidates that pass all three.
 It cannot override a hard-gate failure, and it is never hidden inside a new composite score.
+An explicit `localPreference: luna` profile is not a candidate in this ranking.
+`docs/configuration.md` owns that cost and session-ceiling policy, and `bin/fm-dispatch-resolve.sh` applies it before `spendPriority`.
+Do not treat its missing local quota as healthy headroom, and do not use this procedure to replace a stronger reasoning class with it.
 
 ### 1. Eligibility
 

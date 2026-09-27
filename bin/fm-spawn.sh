@@ -1195,6 +1195,52 @@ CONFIG_INHERIT_LOCK_HELD=0
 GIT_HOOKS_DIR=
 SPAWN_LAUNCH_SENT=0
 SPAWN_ENDPOINT_CLOSED=0
+SPAWN_LOCAL_CAPACITY_HELD=0
+
+spawn_local_capacity_cmd() {
+  FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_CONFIG_OVERRIDE="$CONFIG" \
+    "$SCRIPT_DIR/fm-local-capacity.sh" "$@"
+}
+
+spawn_local_capacity_release() {
+  [ "$SPAWN_LOCAL_CAPACITY_HELD" = 1 ] || return 0
+  SPAWN_LOCAL_CAPACITY_HELD=0
+  spawn_local_capacity_cmd release --task "$ID" >/dev/null 2>&1 || \
+    echo "warning: local session claim for $ID could not be released" >&2
+}
+
+# Admit only when this model is the Luna local-capacity profile. The claim is
+# the ceiling: a later failure releases it, and a successful launch anchors it.
+spawn_local_capacity_admit() {
+  local out matched
+  [ -n "${MODEL:-}" ] && [ "$MODEL" != default ] || return 0
+  [ -f "$CONFIG/crew-dispatch.json" ] || return 0
+  if jq -e --arg model "$MODEL" '
+    def profiles($v): if ($v | type) == "array" then $v elif ($v | type) == "object" then [$v] else [] end;
+    any(.rules[]?; .localPreference == "luna" and any(profiles(.use)[]; .model == $model and has("localCapacity")))
+  ' "$CONFIG/crew-dispatch.json" >/dev/null 2>&1; then
+    :
+  else
+    matched=$?
+    [ "$matched" -eq 1 ] && return 0
+    echo "error: could not read localCapacity for model '$MODEL' from $CONFIG/crew-dispatch.json" >&2
+    return 1
+  fi
+  out=$(spawn_local_capacity_cmd admit --model "$MODEL" --task "$ID" --pid "$$" 2>&1) || {
+    printf '%s\n' "$out" >&2
+    echo "error: local session capacity could not be checked for model '$MODEL'" >&2
+    return 1
+  }
+  case "$out" in
+    *"status: admitted"*)
+      SPAWN_LOCAL_CAPACITY_HELD=1
+      return 0
+      ;;
+  esac
+  printf '%s\n' "$out" >&2
+  echo "error: local session capacity refused model '$MODEL' for task $ID; resolve the dispatch profile again and do not retry this model while the ceiling is full or the inventory is unknown" >&2
+  return 1
+}
 
 spawn_fresh_commit_rollback() {
   if fm_backlog_atomic_transition rollback "$STATE/$ID.meta" \
@@ -1225,6 +1271,9 @@ parse_orca_worktree_result() {
 
 spawn_abort_cleanup() {
   local status=$?
+  if [ "$status" -ne 0 ]; then
+    spawn_local_capacity_release
+  fi
   if [ "$RELAUNCH_REPLACEMENT_PENDING" = 1 ] &&
     [ "$SPAWN_META_PUBLISH_STARTED" = 1 ] &&
     [ -n "$SPAWN_META_TMP" ] &&
@@ -2348,6 +2397,7 @@ fi
 if [ "$HARNESS" = agy ]; then
   agy_model_validate "$AGY_BIN" "$MODEL" || exit 1
 fi
+spawn_local_capacity_admit || exit 1
 # Worker account pin (header above): resolved before any endpoint, worktree, or
 # record exists. An absent pin selects nothing and leaves every later launch
 # step exactly as it was. A pinned Claude root is exported here as well, so the
@@ -5334,6 +5384,11 @@ if [ -n "$SPAWN_DEFERRED_SIGNAL" ]; then
 fi
 fm_lock_release "$SPAWN_META_LOCK"
 SPAWN_META_LOCK_HELD=0
+
+if [ "$SPAWN_LOCAL_CAPACITY_HELD" = 1 ]; then
+  spawn_local_capacity_cmd anchor --task "$ID" >/dev/null 2>&1 || \
+    echo "warning: local session claim for $ID could not be anchored; a provably active endpoint still holds its slot" >&2
+fi
 
 SPAWN_DELIVERY=
 [ -z "$MODE" ] || SPAWN_DELIVERY=" mode=$MODE yolo=$YOLO"

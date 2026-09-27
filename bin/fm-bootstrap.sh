@@ -1117,6 +1117,14 @@ crew_dispatch_validate() {
     elif [(.rules // [])[]? | select(has("select") and ((.select? | type) != "string" or (.select | length) == 0))] | length > 0 then "select must be a non-empty string"
     elif [(.rules // [])[]? | .select? // empty | select(. != "quota-balanced")] | length > 0 then
       "unknown select: " + ([ (.rules // [])[]? | .select? // empty | select(. != "quota-balanced") ] | unique | join(", "))
+    elif [(.rules // [])[]? | select(has("localPreference") and .localPreference != "luna")] | length > 0 then "localPreference must be \"luna\" when present"
+    elif [(.rules // [])[]? | select(has("localPreference") and (.approval? // "") == "captain")] | length > 0 then "localPreference cannot be combined with approval"
+    elif [(.rules // [])[]? | select(has("minRunwaySeconds") and ((.minRunwaySeconds | type) != "number" or .minRunwaySeconds < 0 or .minRunwaySeconds > 2592000 or .minRunwaySeconds != (.minRunwaySeconds | floor)))] | length > 0 then "minRunwaySeconds must be an integer from 0 through 2592000 when present"
+    elif ([([((.rules // [])[]? | profiles(.use?)[]?)] + (if has("default") then profiles(.default) else [] end))[] | select(has("localCapacity") and ((.localCapacity | type) != "object" or (.localCapacity | keys) != ["maxActive"] or (.localCapacity.maxActive | type) != "number" or .localCapacity.maxActive < 1 or .localCapacity.maxActive > 99 or .localCapacity.maxActive != (.localCapacity.maxActive | floor) or (.model? | type) != "string" or (.model | length) == 0))] | length) > 0 then "localCapacity needs maxActive as an integer from 1 through 99 and a model"
+    elif [(.rules // [])[]? | select((.localPreference? // "") != "luna" and any(profiles(.use?)[]?; has("localCapacity")))] | length > 0 then "localCapacity is allowed only on a rule with localPreference luna"
+    elif [(.rules // [])[]? | select(.localPreference? == "luna" and ([profiles(.use?)[]? | select(has("localCapacity"))] | length) != 1)] | length > 0 then "a luna rule needs exactly one localCapacity profile"
+    elif ([.rules[]? | profiles(.use?)[]? | select(has("localCapacity"))] | length) > 1 then "only one localCapacity profile is allowed"
+    elif has("default") and ([profiles(.default)[]? | select(has("localCapacity"))] | length) > 0 then "default profiles cannot declare localCapacity"
     elif has("default") and ((.default | type) != "object" and (.default | type) != "array") then "default must be a profile object or non-empty profile array"
     elif has("default") and ((.default | type) == "array" and (.default | length) == 0) then "default needs at least one profile"
     elif has("default") and ([profiles(.default)[]? | select(type != "object")] | length) > 0 then "each default profile must be an object"

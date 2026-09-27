@@ -105,6 +105,9 @@ Break genuine evidence ties without array-order or harness bias.
 `quota-axi` owns how model or product windows relate to bounding account windows and remains data-only.
 Load `quota-array-dispatch` before choosing among a matched profile array; that skill is the single owner of the TOON-first spendPriority selection procedure.
 Run `bin/fm-dispatch-resolve.sh` directly on the written brief in the same turn, with no preflight, and on `clear` pass its `profile:` line to `fm-spawn` unless you state a reason to override; `ambiguous`, `escalate`, `error`, and off all mean the intake above, unchanged (contract: `docs/configuration.md` "Typed dispatch resolution").
+Same-class alternatives in one rule are ranked by `spendPriority` after runway vetoes; raw remaining percentages are evidence, and unknown quota is never treated as healthy.
+A `localPreference: luna` profile is a cost and session-ceiling choice for that class only, applied before quota ranking.
+When `fm-spawn.sh` refuses it because the ceiling is full or the local inventory cannot prove a free slot, resolve again and do not retry that model.
 The generic effort fallback and its precedence are owned by `harness-adapters`: explicit captain and standing configured effort win; otherwise use low for well-understood explicit work, xhigh for ambiguous investigation or design, intermediate levels proportionally, and never max without explicit captain preference.
 Do not add model-specific versions of that policy.
 

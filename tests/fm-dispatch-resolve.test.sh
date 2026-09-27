@@ -980,7 +980,13 @@ for bad in \
   '{"rules":[{"when":"x","use":{"harness":"grok","effort":"max"}}]}|each use profile effort must be supported by its harness and model' \
   '{"rules":[{"when":"x","use":{"harness":"opencode","model":"anthropic/claude-sonnet-4-5"}}]}|use profiles whose harness lacks one authoritative provider family require provider: opencode' \
   '{"rules":[{"when":"x","use":{"harness":"rovo"}}]}|use profiles whose harness lacks one authoritative provider family require provider: rovo' \
-  '{"rules":[{"when":"x","use":{"harness":"codex"}}],"default":{"harness":"pi","model":"anthropic/claude-sonnet-5"}}|default profiles whose harness lacks one authoritative provider family require provider: pi'; do
+  '{"rules":[{"when":"x","use":{"harness":"codex"}}],"default":{"harness":"pi","model":"anthropic/claude-sonnet-5"}}|default profiles whose harness lacks one authoritative provider family require provider: pi' \
+  '{"rules":[{"when":"x","localPreference":"astra","use":{"harness":"claude"}}]}|localPreference must be "luna" when present' \
+  '{"rules":[{"when":"x","localPreference":"luna","approval":"captain","use":[{"harness":"omp","model":"local-inference-lab/Qwen","localCapacity":{"maxActive":3}}]}]}|localPreference cannot be combined with approval' \
+  '{"rules":[{"when":"x","minRunwaySeconds":1.5,"use":{"harness":"claude"}}]}|minRunwaySeconds must be an integer from 0 through 2592000 when present' \
+  '{"rules":[{"when":"x","use":{"harness":"claude","model":"m","localCapacity":{"maxActive":3}}}]}|localCapacity is allowed only on a rule with localPreference luna' \
+  '{"rules":[{"when":"x","localPreference":"luna","use":{"harness":"codex","model":"gpt-6-luna"}}]}|a luna rule needs exactly one localCapacity profile' \
+  '{"rules":[{"when":"x","localPreference":"luna","use":{"harness":"omp","model":"q","localCapacity":{"maxActive":0}}}]}|localCapacity needs maxActive as an integer from 1 through 99 and a model'; do
   printf '%s\n' "${bad%%|*}" > "$RULES"
   TYPESAFE_API_KEY=$KEY run code out err "$BRIEF"
   expect_code 2 "$code" "malformed rules exit 2: ${bad#*|}"
@@ -999,5 +1005,135 @@ run code out err --help
 expect_code 0 "$code" "--help exits 0"
 assert_contains "$out" 'Usage:' "--help prints usage"
 pass "configuration errors exit 2 before any network call"
+
+# --- spendPriority ranks; raw percent does not, and runway seconds are a gate --
+cp "$BASE_RULES" "$RULES"
+write_quota "$QUOTA" 0.1 0.95
+reset_log
+write_response "$RESPONSE" rule_4 0.9
+TYPESAFE_API_KEY=$KEY run code out err "$BRIEF" --project pager
+assert_contains "$out" "  profile: --harness 'claude' --model 'sonnet' --effort 'high'" "higher spendPriority wins over a higher remaining percent"
+assert_contains "$out" 'candidate: claude:sonnet  provider=claude  scope=all_models  remaining=79%  spendPriority=0.95' "the lower percent stays visible as evidence"
+assert_contains "$out" 'candidate: cursor:cursor-grok-4.6-medium  provider=cursor  scope=all_models  remaining=91%  spendPriority=0.1' "the higher percent does not become the rank"
+pass "raw remaining percent is not the ranker"
+
+jq '(.providers[] | select(.provider == "claude") | .quotaSemantics.effectiveAvailability[] | select(.scope == "all_models") | .runway.usableRunwaySeconds) = 30 | (.providers[] | select(.provider == "claude") | .quotaSemantics.effectiveAvailability[] | select(.scope == "all_models") | .selection.spendPriority) = 0.95' "$QUOTA" > "$TMP_ROOT/quota-seconds.json"
+cp "$TMP_ROOT/quota-seconds.json" "$QUOTA"
+reset_log
+TYPESAFE_API_KEY=$KEY run code out err "$BRIEF" --project pager
+assert_contains "$out" 'runwaySeconds=30' "a positive finite runway prints its seconds"
+assert_contains "$out" "  profile: --harness 'claude' --model 'sonnet' --effort 'high'" "without minRunwaySeconds a positive finite runway stays rankable"
+pass "positive finite runway stays rankable and discloses its seconds"
+
+jq '.rules[3].minRunwaySeconds = 7200' "$BASE_RULES" > "$RULES"
+reset_log
+TYPESAFE_API_KEY=$KEY run code out err "$BRIEF" --project pager
+assert_contains "$out" '-> not eligible: runway 30s at all_models below minRunwaySeconds 7200' "a short projected runway misses the declared horizon"
+assert_contains "$out" "  profile: --harness 'cursor' --model 'cursor-grok-4.6-medium'" "the through_reset candidate is chosen instead"
+pass "minRunwaySeconds refuses a projected runway that will not last"
+
+jq '(.providers[] | select(.provider == "claude") | .quotaSemantics.effectiveAvailability[] | select(.scope == "all_models") | .runway.usableRunwaySeconds) = 0' "$QUOTA" > "$TMP_ROOT/quota-zero.json"
+cp "$TMP_ROOT/quota-zero.json" "$QUOTA"
+cp "$BASE_RULES" "$RULES"
+reset_log
+TYPESAFE_API_KEY=$KEY run code out err "$BRIEF" --project pager
+assert_contains "$out" '-> not eligible: runway seconds 0 at all_models' "non-positive runway seconds are ineligible without a horizon field"
+assert_contains "$out" "  profile: --harness 'cursor' --model 'cursor-grok-4.6-medium'" "a zero-second runway cannot win the argmax"
+pass "non-positive runway seconds are refused"
+
+jq 'del(.providers[] | select(.provider == "claude") | .quotaSemantics.effectiveAvailability[] | select(.scope == "all_models") | .runway.usableRunwaySeconds)' "$TMP_ROOT/quota-seconds.json" > "$QUOTA"
+jq '.rules[3].minRunwaySeconds = 7200' "$BASE_RULES" > "$RULES"
+reset_log
+TYPESAFE_API_KEY=$KEY run code out err "$BRIEF" --project pager
+assert_contains "$out" 'projected runway seconds unknown at all_models: not assumed to last' "a missing duration is not treated as long enough"
+assert_contains "$out" "  profile: --harness 'cursor' --model 'cursor-grok-4.6-medium'" "an unproven projected runway does not outrank a known through_reset"
+pass "unknown projected runway duration is not assumed to last"
+
+# --- Luna local capacity is a cost policy, not a quota rank -------------------
+LUNA_MODEL='local-inference-lab/Qwen3.8-Flash-Next-NVFP4'
+cat > "$RULES" <<JSON
+{
+  "rules": [
+    {
+      "when": "The task is well-understood explicit work at gpt-6-luna complexity.",
+      "localPreference": "luna",
+      "use": [
+        {"harness": "omp", "model": "$LUNA_MODEL", "localCapacity": {"maxActive": 3}},
+        {"harness": "codex", "model": "gpt-6-luna", "effort": "medium"}
+      ]
+    }
+  ]
+}
+JSON
+cat > "$RESPONSE" <<'JSON'
+{"model":"jev-1.13.0","answers":{"rule":{"type":"choice","choice":"rule_1","confidence":0.93,"probabilities":{"rule_1":0.93,"default":0.07}}},"usage":{"input_tokens":100,"output_tokens":40}}
+JSON
+write_quota "$QUOTA" 0.2 -0.4
+hold_slots() { # <n>
+  local i pid
+  HELD_PIDS=""
+  for i in $(seq 1 "$1"); do
+    sleep 300 &
+    pid=$!
+    HELD_PIDS="$HELD_PIDS $pid"
+    FM_HOME="$HOME_DIR" "$ROOT/bin/fm-local-capacity.sh" admit --model "$LUNA_MODEL" --max 3 --task "slot$i" --pid "$pid" >/dev/null
+  done
+}
+release_slots() {
+  local pid
+  for pid in $HELD_PIDS; do
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  done
+  HELD_PIDS=""
+  rm -rf "$HOME_DIR/state/local-capacity.d"
+}
+HELD_PIDS=""
+trap 'release_slots; fm_test_cleanup' EXIT
+
+reset_log
+TYPESAFE_API_KEY=$KEY run code out err "$BRIEF" --project pager
+assert_contains "$out" '  status: clear' "an empty local inventory can clear"
+assert_contains "$out" "  profile: --harness 'omp' --model '$LUNA_MODEL'" "zero occupants select the local model"
+assert_contains "$out" 'localCapacity active=0 max=3  -> local preference' "the choice is named as local preference"
+assert_contains "$out" 'not a quota ranking' "local preference is not described as a quota win"
+local_line=$(printf '%s\n' "$out" | grep 'candidate: omp:' || true)
+case "$local_line" in
+  *spendPriority*) fail "local preference printed a spendPriority: $local_line" ;;
+esac
+pass "zero local occupants prefer the Luna local model without a quota rank"
+
+hold_slots 2
+reset_log
+TYPESAFE_API_KEY=$KEY run code out err "$BRIEF" --project pager
+assert_contains "$out" "  profile: --harness 'omp' --model '$LUNA_MODEL'" "two occupants still leave a slot"
+assert_contains "$out" 'localCapacity active=2 max=3  -> local preference' "active 2 is below the ceiling"
+pass "two local occupants still prefer the local model"
+
+release_slots
+hold_slots 3
+reset_log
+TYPESAFE_API_KEY=$KEY run code out err "$BRIEF" --project pager
+assert_contains "$out" 'localCapacity active=3 max=3  -> not selected: local capacity full' "three occupants fill the ceiling"
+assert_contains "$out" "  profile: --harness 'codex' --model 'gpt-6-luna' --effort 'medium'" "the same-class paid profile is the fallback"
+assert_not_contains "$out" "profile: --harness 'omp'" "a full ceiling does not launch another local session"
+pass "three local occupants fall through to the paid Luna model"
+
+release_slots
+mkdir -p "$HOME_DIR/state"
+printf 'model=other\n' > "$HOME_DIR/state/mystery.meta"
+chmod 000 "$HOME_DIR/state/mystery.meta"
+reset_log
+TYPESAFE_API_KEY=$KEY run code out err "$BRIEF" --project pager
+assert_contains "$out" 'not selected: local inventory unknown; a free slot was not inferred' "an unreadable record is not a free slot"
+assert_contains "$out" "  profile: --harness 'codex' --model 'gpt-6-luna' --effort 'medium'" "unknown inventory uses the paid same-class profile"
+pass "unknown local inventory does not select the local model"
+chmod 644 "$HOME_DIR/state/mystery.meta" 2>/dev/null || true
+rm -f "$HOME_DIR/state/mystery.meta"
+release_slots
+trap 'fm_test_cleanup' EXIT
+
+cp "$BASE_RULES" "$RULES"
+write_quota "$QUOTA" 0.7597
 
 printf '# all fm-dispatch-resolve tests passed\n'

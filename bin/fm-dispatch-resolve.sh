@@ -29,9 +29,15 @@
 #   bin/fm-quota-axi-lib.sh, so a Pi lane such as openai-codex-work/...
 #   reads its own account's row and an expanded provider with no row for the
 #   candidate is unmeasured, never blocked), and the spendPriority argmax over
-#   the eligible candidates. The model never sees quota, catalogs, approvals,
-#   confidence floors, `why`, or `use`. With no rules, it returns a non-clear
-#   result so firstmate keeps using the existing intake.
+#   the eligible candidates. A rule minRunwaySeconds, when set, refuses a
+#   known projected runway shorter than that horizon and does not treat a
+#   missing runway duration as long enough. Non-positive known runway seconds
+#   are refused even without that field. Raw percentages are never compared.
+#   A localPreference luna profile is chosen from bin/fm-local-capacity.sh
+#   before that argmax, and only when the count is known and below maxActive.
+#   Its missing local quota is not a rank. The model never sees quota,
+#   catalogs, approvals, confidence floors, `why`, or `use`. With no rules,
+#   it returns a non-clear result so firstmate keeps using the existing intake.
 #   docs/configuration.md "Crew dispatch profiles" owns the declared fields and
 #   "Typed dispatch resolution" owns this tool's operator contract.
 #
@@ -186,6 +192,14 @@ rules_err=$(jq -r --argjson verified_harnesses "$VERIFIED_HARNESSES" --arg provi
   elif any((.rules // [])[]; has("select") and ((.select | type) != "string" or (.select | length) == 0)) then "select must be a non-empty string"
   elif any((.rules // [])[]; has("select") and .select != "quota-balanced") then
     "unknown select: " + ([.rules[] | select(has("select") and .select != "quota-balanced") | .select] | unique | join(", "))
+  elif any((.rules // [])[]; has("localPreference") and .localPreference != "luna") then "localPreference must be \"luna\" when present"
+  elif any((.rules // [])[]; has("localPreference") and (.approval // "") == "captain") then "localPreference cannot be combined with approval"
+  elif any((.rules // [])[]; has("minRunwaySeconds") and ((.minRunwaySeconds | type) != "number" or .minRunwaySeconds < 0 or .minRunwaySeconds > 2592000 or .minRunwaySeconds != (.minRunwaySeconds | floor))) then "minRunwaySeconds must be an integer from 0 through 2592000 when present"
+  elif any(([((.rules // [])[] | profiles(.use)[])] + (if has("default") then profiles(.default) else [] end))[]; has("localCapacity") and ((.localCapacity | type) != "object" or (.localCapacity | keys) != ["maxActive"] or (.localCapacity.maxActive | type) != "number" or .localCapacity.maxActive < 1 or .localCapacity.maxActive > 99 or .localCapacity.maxActive != (.localCapacity.maxActive | floor) or (.model | type) != "string" or (.model | length) == 0)) then "localCapacity needs maxActive as an integer from 1 through 99 and a model"
+  elif any((.rules // [])[]; (.localPreference // "") != "luna" and any(profiles(.use)[]; has("localCapacity"))) then "localCapacity is allowed only on a rule with localPreference luna"
+  elif any((.rules // [])[]; .localPreference == "luna" and ([profiles(.use)[] | select(has("localCapacity"))] | length) != 1) then "a luna rule needs exactly one localCapacity profile"
+  elif (([.rules[]? | profiles(.use)[] | select(has("localCapacity"))] | length) > 1) then "only one localCapacity profile is allowed"
+  elif (has("default") and any(profiles(.default)[]; has("localCapacity"))) then "default profiles cannot declare localCapacity"
   elif any((.rules // [])[]; has("floor") and floor_bad(.floor; true)) then "rule floor needs scope, min_percent 0..100, and provider matching ^[a-z0-9]+(-[a-z0-9]+)*\\z"
   elif any((.rules // [])[] | profiles(.use)[]; profile_bad(.)) then "each use profile needs harness; model, effort, and floor must be well formed, and provider must match ^[a-z0-9]+(-[a-z0-9]+)*\\z when present"
   elif any((.rules // [])[]; duplicate_profiles(profiles(.use))) then "each rule use must not contain duplicate harness, model, and effort profiles"
@@ -202,7 +216,7 @@ rules_err=$(jq -r --argjson verified_harnesses "$VERIFIED_HARNESSES" --arg provi
 
 missing_provider=$(jq -r '
   def profiles($v): if ($v | type) == "array" then $v elif ($v | type) == "object" then [$v] else [] end;
-  ((.rules // [])[] | profiles(.use)[] | select(has("provider") | not) | "use\t\(.harness)"),
+  ((.rules // [])[] | profiles(.use)[] | select(has("provider") | not) | select(has("localCapacity") | not) | "use\t\(.harness)"),
   (profiles(.default // null)[] | select(has("provider") | not) | "default\t\(.harness)")
 ' "$RULES" | while IFS=$'\t' read -r location harness; do
   if ! fm_quota_single_provider_for_harness "$harness" >/dev/null; then
@@ -348,8 +362,27 @@ command -v quota-axi >/dev/null 2>&1 || emit_error "quota-axi not installed"
 quota-axi --json > "$QUOTA" 2>/dev/null || emit_error "quota-axi --json failed"
 fm_quota_json_valid < "$QUOTA" || emit_error "quota-axi --json returned an invalid snapshot"
 
+# ---- local capacity: one count per Luna model, never a quota rank ------------
+CAPACITY_JSON='{}'
+while IFS= read -r local_model; do
+  [ -n "$local_model" ] || continue
+  cap_out=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="${FM_STATE_OVERRIDE:-$FM_HOME/state}" FM_CONFIG_OVERRIDE="$CONFIG" \
+    "$SCRIPT_DIR/fm-local-capacity.sh" count --model "$local_model" 2>/dev/null) || cap_out=''
+  cap_status=$(printf '%s\n' "$cap_out" | awk '/^  status: / { sub(/^  status: /, ""); print; exit }')
+  cap_active=$(printf '%s\n' "$cap_out" | awk '/^  active: / { sub(/^  active: /, ""); print; exit }')
+  cap_reason=$(printf '%s\n' "$cap_out" | awk '/^  reason: / { sub(/^  reason: /, ""); print; exit }')
+  [ -n "$cap_status" ] || { cap_status=unknown; cap_reason='local capacity count failed'; }
+  CAPACITY_JSON=$(jq -c --arg model "$local_model" --arg status "$cap_status" --arg active "$cap_active" --arg reason "$cap_reason" '
+    . + {($model): {status: $status, active: (if $active | test("^[0-9]+$") then ($active | tonumber) else null end), reason: $reason}}
+  ' <<<"$CAPACITY_JSON") || emit_error "local capacity snapshot failed"
+done < <(jq -r '
+  def profiles($v): if ($v | type) == "array" then $v elif ($v | type) == "object" then [$v] else [] end;
+  [.rules[]? | select(.localPreference == "luna") | profiles(.use)[] | select(has("localCapacity")) | .model] | unique | .[]
+' "$RULES")
+
 # ---- resolution: declared gates + quota evidence + argmax, all in jq ------------
 RESULT=$(jq -n --arg floor "$CONFIDENCE_FLOOR" --argjson lat "$LAT_MS" --arg none_criterion "$DEFAULT_WHEN" --argjson pmap "$PMAP" \
+  --argjson capacity "$CAPACITY_JSON" \
   --slurpfile resp "$RESP_FILE" --slurpfile rules "$RULES" --slurpfile quota "$QUOTA" "$FM_QUOTA_ROW_JQ"'
   ($resp[0]) as $r | ($rules[0]) as $cfg | ($quota[0]) as $q | ($r.answers.rule) as $a |
   def profiles($v): if ($v | type) == "array" then $v elif ($v | type) == "object" then [$v] else [] end;
@@ -376,8 +409,10 @@ RESULT=$(jq -n --arg floor "$CONFIDENCE_FLOOR" --argjson lat "$LAT_MS" --arg non
         end
     end;
   def evidence($rows):
-    $rows | map({scope, status, pct: (.effectivePercentRemaining // null), runway: (.runway.status // null), spendPriority: (.selection.spendPriority // null)});
-  def evaluate($c):
+    $rows | map({scope, status, pct: (.effectivePercentRemaining // null), runway: (.runway.status // null), spendPriority: (.selection.spendPriority // null), runwaySeconds: (if (.runway.usableRunwaySeconds | type) == "number" then .runway.usableRunwaySeconds else null end)});
+  def runway_seconds($rows):
+    [$rows[]? | .runway.usableRunwaySeconds | select(type == "number")] | if length == 0 then null else min end;
+  def evaluate($c; $horizon):
     (provider_of($c)) as $p | (lane_of($c)) as $lane |
     if $p == null then {profile: $c, eligible: false, reason: "no provider family for harness \($c.harness); declare provider on the profile"}
     elif prov($p; $lane) == null then
@@ -415,10 +450,20 @@ RESULT=$(jq -n --arg floor "$CONFIDENCE_FLOOR" --argjson lat "$LAT_MS" --arg non
       elif any($rows[]; (.selection.spendPriority | type) != "number") then
         ($rows | map(select((.selection.spendPriority | type) != "number")) | first) as $bad |
         {profile: $c, provider: $p, bounds: $bounds, scope: $bad.scope, pct: $bad.effectivePercentRemaining, runway: $bad.runway.status, eligible: true, unranked: true, reason: "spendPriority missing or non-numeric at \($bad.scope): not rankable"}
+      elif ($horizon != null) and any($rows[]; (.runway.status // "") == "projected_exhaustion" and ((.runway.usableRunwaySeconds | type) != "number")) then
+        ($rows | map(select((.runway.status // "") == "projected_exhaustion" and ((.runway.usableRunwaySeconds | type) != "number"))) | first) as $bad |
+        {profile: $c, provider: $p, bounds: $bounds, scope: $bad.scope, pct: $bad.effectivePercentRemaining, runway: $bad.runway.status, eligible: true, unranked: true, unknown: true, reason: "projected runway seconds unknown at \($bad.scope): not assumed to last"}
+      elif any($rows[]; (.runway.usableRunwaySeconds | type) == "number" and .runway.usableRunwaySeconds <= 0) then
+        ($rows | map(select((.runway.usableRunwaySeconds | type) == "number" and .runway.usableRunwaySeconds <= 0)) | first) as $bad |
+        {profile: $c, provider: $p, bounds: $bounds, scope: $bad.scope, pct: $bad.effectivePercentRemaining, runway: $bad.runway.status, runwaySeconds: $bad.runway.usableRunwaySeconds, eligible: false, reason: "runway seconds \($bad.runway.usableRunwaySeconds) at \($bad.scope)"}
+      elif ($horizon != null) and any($rows[]; (.runway.usableRunwaySeconds | type) == "number" and .runway.usableRunwaySeconds < $horizon) then
+        ($rows | map(select((.runway.usableRunwaySeconds | type) == "number" and .runway.usableRunwaySeconds < $horizon)) | first) as $bad |
+        {profile: $c, provider: $p, bounds: $bounds, scope: $bad.scope, pct: $bad.effectivePercentRemaining, runway: $bad.runway.status, runwaySeconds: $bad.runway.usableRunwaySeconds, eligible: false, reason: "runway \($bad.runway.usableRunwaySeconds)s at \($bad.scope) below minRunwaySeconds \($horizon)"}
       else
         ($rows | min_by(.selection.spendPriority)) as $limiting |
         {profile: $c, provider: $p, bounds: $bounds, scope: $limiting.scope, pct: $limiting.effectivePercentRemaining,
-         spendPriority: $limiting.selection.spendPriority, runway: $limiting.runway.status, eligible: true, reason: "ok"}
+         spendPriority: $limiting.selection.spendPriority, runway: $limiting.runway.status,
+         runwaySeconds: runway_seconds($rows), eligible: true, reason: "ok"}
       end
     end;
   def rule_at($c):
@@ -468,24 +513,46 @@ RESULT=$(jq -n --arg floor "$CONFIDENCE_FLOOR" --argjson lat "$LAT_MS" --arg non
   }
   + (if $fb.to then {fallback: "\($choice) (\(when_of($choice))) probability \($fb.p) clears its floor \($fb.to_floor); \($picked) probability \($a.probabilities[$picked]) is below its floor \($picked_floor)"} else {} end)
   as $ev |
+  (if ($sel.source // "") == "default" or $rule == null then null else ($rule.minRunwaySeconds // null) end) as $horizon |
+  (if ($sel.source // "") == "default" or $rule == null then "" else ($rule.localPreference // "") end) as $luna |
   if $sel.invalid then $ev + {status: "error", reason: $sel.invalid}
   elif $fb.below and $fb.global then
-    $ev + {status: "ambiguous", reason: "confidence \($a.confidence) below floor \($floor)", candidates: ($answer_use | map(evaluate(.)))}
+    $ev + {status: "ambiguous", reason: "confidence \($a.confidence) below floor \($floor)", candidates: ($answer_use | map(evaluate(.; $horizon)))}
   elif $fb.below and ($fb.to | not) then
-    $ev + {status: "ambiguous", reason: "\($picked) probability \($a.probabilities[$picked]) below its floor \($picked_floor); \($fb.why)", candidates: ($answer_use | map(evaluate(.)))}
+    $ev + {status: "ambiguous", reason: "\($picked) probability \($a.probabilities[$picked]) below its floor \($picked_floor); \($fb.why)", candidates: ($answer_use | map(evaluate(.; $horizon)))}
   elif $sel.escalate then
-    $ev + {status: "escalate", reason: $sel.escalate, candidates: ($answer_use | map(evaluate(.)))}
+    $ev + {status: "escalate", reason: $sel.escalate, candidates: ($answer_use | map(evaluate(.; $horizon)))}
   elif ($sel.use | length) == 0 then $ev + {status: "escalate", reason: "no profiles configured for \($sel.source)", note: $sel.note, candidates: []}
   else
-    ($sel.use | map(evaluate(.))) as $cands |
+    def local_decision($profile):
+      ($capacity[$profile.model] // {status: "unknown", active: null, reason: "no local capacity reading"}) as $cap |
+      ($profile.localCapacity.maxActive) as $max |
+      if $cap.status != "known" or ($cap.active | type) != "number" then
+        {take: false, active: null, max: $max, why: "local inventory unknown; a free slot was not inferred" + (if ($cap.reason // "") == "" or ($cap.reason // "-") == "-" then "" else ": " + $cap.reason end)}
+      elif $cap.active < $max then
+        {take: true, active: $cap.active, max: $max, why: "local capacity open"}
+      else
+        {take: false, active: $cap.active, max: $max, why: "local capacity full"}
+      end;
+    def annotate($c):
+      if $luna != "luna" or (($c.profile.localCapacity // null) == null) then $c
+      else
+        (local_decision($c.profile)) as $decision |
+        $c + {local: $decision, eligible: false, unranked: false}
+      end;
+    ($sel.use | map(evaluate(.; $horizon) | annotate(.))) as $cands |
     ([$cands[] | select(.eligible and ((.unranked // false) | not))]) as $elig |
     ([$cands[] | select(.unranked)]) as $unranked |
-    if ($elig | length) == 0 then $ev + {status: "escalate", reason: "no rankable eligible candidate", note: $sel.note, candidates: $cands}
+    ([$cands[] | select(.local.take == true)] | .[0]) as $local_choice |
+    (if any($cands[]; .local) then {local_note: "local preference is cost and capacity, not a quota ranking; non-Firstmate sessions on the local server are not counted, and workers outside this home are not counted"} else {} end) as $local_meta |
+    if $local_choice then
+      $ev + {status: "clear", note: $sel.note, candidates: $cands, chosen: $local_choice} + $local_meta
+    elif ($elig | length) == 0 then $ev + {status: "escalate", reason: "no rankable eligible candidate", note: $sel.note, candidates: $cands} + $local_meta
     else
       ($elig | max_by(.spendPriority)) as $best |
       ([$elig[] | select(.spendPriority == $best.spendPriority)] | length) as $ties |
-      if $ties > 1 then $ev + {status: "escalate", reason: "genuine spendPriority tie", note: $sel.note, candidates: $cands}
-      else $ev + {status: "clear", note: $sel.note, candidates: $cands, chosen: $best}
+      if $ties > 1 then $ev + {status: "escalate", reason: "genuine spendPriority tie", note: $sel.note, candidates: $cands} + $local_meta
+      else $ev + {status: "clear", note: $sel.note, candidates: $cands, chosen: $best} + $local_meta
         + (if ($unranked | length) > 0 then
              {unranked_note: "\($unranked | length) eligible candidate(s) unranked (\([$unranked[].provider] | unique | join(", ")))"}
            else {} end)
@@ -505,12 +572,19 @@ TEXT=$(jq -r '
   (if .fallback then "  fallback: \(.fallback | flat)" else empty end),
   (if .reason then "  reason: \(.reason | flat)" else empty end),
   (if .note then "  note: \(.note | flat)" else empty end),
+  (if .local_note then "  note: \(.local_note | flat)" else empty end),
   (if .unranked_note then "  note: \(.unranked_note | flat)" else empty end),
-  (.candidates[]? | "  candidate: \(.profile.harness | flat):\(show(.profile.model))"
+  (.candidates[]? | if .local then
+      "  candidate: \(.profile.harness | flat):\(show(.profile.model))  localCapacity active=\(show(.local.active)) max=\(.local.max)  -> "
+        + (if .local.take then "local preference" else "not selected: \(.local.why | flat)" end)
+    else
+      "  candidate: \(.profile.harness | flat):\(show(.profile.model))"
       + (if .provider then "  provider=\(.provider | flat)" else "" end)
       + (if .scope then "  scope=\(.scope | flat)  remaining=\(show(.pct))%  spendPriority=\(show(.spendPriority))  runway=\(show(.runway))" else "" end)
+      + (if (.runwaySeconds | type) == "number" then "  runwaySeconds=\(.runwaySeconds)" else "" end)
       + (if (.bounds // [] | length) > 1 then "  bounds=" + ([.bounds[] | "\(.scope | flat):\(show(.pct))%/\((.runway // .status) | flat)"] | join(",")) else "" end)
-      + "  -> " + (if .unranked then "eligible, unranked: \(.reason | flat): disclosed uncertainty" elif .eligible then "eligible" else "not eligible: \(.reason | flat)" end)),
+      + "  -> " + (if .unranked then "eligible, unranked: \(.reason | flat): disclosed uncertainty" elif .eligible then "eligible" else "not eligible: \(.reason | flat)" end)
+    end),
   (if .chosen then "  profile: --harness \(.chosen.profile.harness | shell_arg)"
       + (if .chosen.profile.model then " --model \(.chosen.profile.model | shell_arg)" else "" end)
       + (if .chosen.profile.effort then " --effort \(.chosen.profile.effort | shell_arg)" else "" end) else empty end)' <<<"$RESULT") || emit_error "output rendering failed"

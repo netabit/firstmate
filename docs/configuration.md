@@ -998,10 +998,19 @@ This section is the single owner of the canonical schema and its per-field seman
       "approval": "captain",
       "min_confidence": 0.85,
       "floor": { "scope": "<quota-axi scope>", "min_percent": 20, "provider": "<quota-axi provider>" },
+      "minRunwaySeconds": 7200,
       "use": [
         { "harness": "<adapter>", "model": "<optional model>", "effort": "<low|medium|high|xhigh|max|ultra, optional>", "provider": "<optional quota-axi provider>", "floor": { "scope": "<quota-axi scope>", "min_percent": 50 } }
       ],
       "why": "<optional rationale that helps firstmate choose>"
+    },
+    {
+      "when": "<gpt-6-luna complexity, not a stronger reasoning class>",
+      "localPreference": "luna",
+      "use": [
+        { "harness": "<adapter>", "model": "<exact local model>", "localCapacity": { "maxActive": 3 } },
+        { "harness": "<adapter>", "model": "<same-class paid model>" }
+      ]
     }
   ],
   "default": [
@@ -1019,6 +1028,7 @@ This section is the single owner of the canonical schema and its per-field seman
 | `use` and optional top-level `default` | Accept one profile object or a non-empty array of profile objects; the single-object form remains fully backward-compatible. |
 | Profile `harness` | Required in every profile. |
 | Profile `model` and `effort`; rule `why` | Optional. |
+| Rule `localPreference`, `minRunwaySeconds`; profile `localCapacity` | Optional. `localPreference` accepts only `"luna"`. |
 
 **Fields applied only by typed resolution**
 
@@ -1056,6 +1066,62 @@ This single-provider table is separate from the frozen legacy mapping used by `f
 
 - A profile `floor` contains only `scope` and `min_percent`, always uses that profile's provider and matched account, and makes that one candidate ineligible below `min_percent` on the named scope.
 - An absent or unknown named row also makes the candidate unrankable and is reported as an unverifiable floor, not as a known shortfall.
+
+**Luna local capacity and same-class runway**
+
+`localPreference: "luna"` marks one rule as the gpt-6-luna complexity class.
+That rule's `use` array holds exactly one profile with `localCapacity` and any same-class paid alternatives.
+`localCapacity` is `{ "maxActive": <integer 1 through 99> }` and requires that profile's `model`.
+`maxActive` 3 means zero, one, or two existing occupants allow the next launch, and three do not.
+The local profile is a cost and session-ceiling choice, not a quota candidate.
+`bin/fm-dispatch-resolve.sh` selects it only when `bin/fm-local-capacity.sh count` for that exact model is known and the occupant count is below `maxActive`.
+A full ceiling or an unknown inventory skips it and ranks the rule's other profiles.
+Unknown inventory is never read as a free slot.
+The count includes only this home's local Firstmate task records whose recorded model matches and whose endpoint is alive, or whose endpoint cannot be proved idle.
+A dead or missing endpoint does not occupy a slot.
+A record with `remote_host` is not local.
+Sessions that are not Firstmate task records in this home, including other homes and any process attached to the local server outside Firstmate, are not counted, and both the capacity command and a resolved Luna rule say so.
+`fm-spawn.sh` admits the same model under a lock before launch, so two concurrent spawns cannot both take the last free slot.
+A refusal means resolve again and do not retry that model until the count is known and below the ceiling.
+The claim holds the slot through launch and while the endpoint is not provably idle.
+It does not by itself keep a slot after the endpoint has been dead or missing for longer than the 30 second launch window.
+A harness with no single quota provider, such as `omp`, may omit `provider` on the local-capacity profile because that profile is not quota-ranked.
+Do not put `localCapacity` on a stronger class, on `default`, or beside `approval`.
+The tool does not infer which model name is stronger than another, so a Luna rule that also lists a stronger model is a configuration mistake.
+Keep one rule per complexity class, in the existing intelligence order, and turn a single-model rule into an array only for same-class alternatives.
+For the current model ids, that shape is a strongest rule for `openai-codex/gpt-6-astra`, then `grok-4.7`, then `openai-codex/gpt-6-sol`, then the Luna rule below.
+Each profile keeps the harness already used for that model.
+The Luna rule is the only place the local model appears:
+
+```json
+{
+  "when": "The task is well-understood explicit work at gpt-6-luna complexity, not design or ambiguous investigation.",
+  "localPreference": "luna",
+  "use": [
+    {
+      "harness": "<harness already used for the local model>",
+      "model": "local-inference-lab/Qwen3.8-Flash-Next-NVFP4",
+      "localCapacity": { "maxActive": 3 }
+    },
+    {
+      "harness": "<harness already used for gpt-6-luna>",
+      "model": "openai-codex/gpt-6-luna"
+    }
+  ]
+}
+```
+
+`minRunwaySeconds` belongs on a same-class array when a known projected runway should lose to a provider that lasts longer than the task.
+It is not required for the Luna local profile, and omitting it leaves positive finite runways rankable by `spendPriority`.
+
+Same-class paid alternatives stay an ordinary profile array ranked by numeric `spendPriority` after the existing exhaustion and zero-remaining vetoes.
+Raw `effectivePercentRemaining` values are evidence on the result line and are never compared across providers.
+A known `usableRunwaySeconds` of zero or less makes that candidate ineligible.
+Optional rule `minRunwaySeconds` (an integer from 0 through 2592000) additionally makes a known projected runway shorter than that many seconds ineligible, and leaves a projected runway with no numeric duration unranked rather than treating it as long enough.
+`through_reset` still passes without comparing `resetsAt` to the horizon.
+Without `minRunwaySeconds`, a positive finite runway stays rankable and its seconds are printed when the snapshot has them.
+That disclosure is not a completion-horizon judgment.
+Unknown or missing `spendPriority` stays unranked and is never treated as healthy, including a local model with no quota row.
 
 **Model, effort, and fallback behavior**
 
@@ -1142,6 +1208,8 @@ After the answer, code applies all remaining checks and ranking:
 - Each candidate's `provider` and `floor`.
 - Every applicable account-wide and model/product row from one `quota-axi --json` snapshot.
 - The numeric `spendPriority` argmax over candidates, using each candidate's limiting row.
+- A rule `minRunwaySeconds` and non-positive known runway seconds, under "Luna local capacity and same-class runway" above.
+- A `localPreference: "luna"` profile, chosen from `bin/fm-local-capacity.sh` before that argmax when the count is known and below `maxActive`.
 
 The [shared quota library](../bin/fm-quota-axi-lib.sh) accepts schema 5 and schema 6 and implements the [account-matching contract](../.agents/skills/quota-array-dispatch/SKILL.md#1-eligibility).
 
@@ -1184,7 +1252,9 @@ Every result above exits 0.
 **Firstmate retains the dispatch decision**
 
 The tool never replaces firstmate's judgment, `quota-array-dispatch`, the captain-approval gate, or `fm-spawn.sh` validation; `AGENTS.md` section 4 owns what firstmate does with each outcome.
-By accepted design, a `clear` result does not enforce catalog/authentication, reasoning-class, or completion-runway gates.
+By accepted design, a `clear` result does not enforce catalog or authentication gates, and it does not invent a completion horizon.
+An explicit `minRunwaySeconds`, a non-positive known runway, and the Luna local-capacity rule are the runway and cost checks it does enforce.
+Reasoning class stays the rule the model matched: quota ranking cannot replace that rule with a weaker one, and the local profile is eligible only inside `localPreference: "luna"`.
 
 Firstmate passes its profile line unless it states a reason to override, such as the brief's reasoning class or an eligible-unranked-candidate note; every non-clear result returns to the full existing intake.
 
