@@ -103,6 +103,49 @@ assert_contains "$out" '  active: 0' "a remote worker and a different model do n
 pass "only a matching local record can occupy a slot"
 
 reset_state
+CHILD_HOME="$TMP_ROOT/child-home"
+mkdir -p "$CHILD_HOME/state" "$CHILD_HOME/data" "$HOME_DIR/data"
+printf 'worker-a\n' > "$CHILD_HOME/.fm-secondmate-home"
+printf 'schema=fm-secondmate-parent.v1\nroute=local\nparent_home=%s\n' "$HOME_DIR" > "$CHILD_HOME/.fm-secondmate-parent"
+printf '%s\n' "- worker-a - fixture (home: $CHILD_HOME; scope: test; projects: none; added 2026-01-01)" > "$HOME_DIR/data/secondmates.md"
+sleep 300 &
+pid=$!
+SLOTS="$pid"
+cap admit --model "$MODEL" --max 3 --task remote1 --pid "$pid" >/dev/null
+mkdir -p "$CHILD_HOME/state/local-capacity.d"
+cp "$STATE_DIR/local-capacity.d/remote1" "$CHILD_HOME/state/local-capacity.d/remote1"
+rm -f "$STATE_DIR/local-capacity.d/remote1"
+out=$(cap count --model "$MODEL")
+assert_contains "$out" '  active: 1' "a claim in a registered local child home occupies a slot"
+out=$(FM_HOME="$CHILD_HOME" "$TOOL" count --model "$MODEL")
+assert_contains "$out" '  active: 1' "a child home sees its parent's registered group"
+cp "$CHILD_HOME/state/local-capacity.d/remote1" "$STATE_DIR/local-capacity.d/remote1"
+out=$(cap count --model "$MODEL")
+assert_contains "$out" '  active: 2' "equal task ids in separate homes occupy separate slots"
+rm -f "$STATE_DIR/local-capacity.d/remote1"
+rm -f "$CHILD_HOME/state/local-capacity.d/remote1"
+mkdir -p "$TMP_ROOT/cross-home-burst"
+sleep 300 &
+pid_a=$!
+sleep 300 &
+pid_b=$!
+SLOTS="$pid_a $pid_b"
+cap admit --model "$MODEL" --max 1 --task parent-race --pid "$pid_a" > "$TMP_ROOT/cross-home-burst/parent" &
+race_a=$!
+FM_HOME="$CHILD_HOME" "$TOOL" admit --model "$MODEL" --max 1 --task child-race --pid "$pid_b" > "$TMP_ROOT/cross-home-burst/child" &
+race_b=$!
+wait "$race_a" || fail "parent capacity admission failed"
+wait "$race_b" || fail "child capacity admission failed"
+admitted=$(grep -h '  status: admitted' "$TMP_ROOT/cross-home-burst"/* | wc -l | tr -d ' ')
+[ "$admitted" = 1 ] || fail "cross-home concurrent admissions accepted $admitted, want 1"
+rm -f "$HOME_DIR/data/secondmates.md"
+rm -rf "$CHILD_HOME"
+kill "$pid" "$pid_a" "$pid_b" 2>/dev/null || true
+wait "$pid" "$pid_a" "$pid_b" 2>/dev/null || true
+SLOTS=""
+pass "capacity includes workers and claims in registered local homes"
+
+reset_state
 sleep 300 &
 pid=$!
 SLOTS="$pid"

@@ -11,7 +11,7 @@
 # docs/configuration.md "Crew dispatch profiles" owns the rule fields.
 # The count is not a quota reading and never treats unknown quota as healthy.
 #
-# count prints the number of slots occupied by this model in this home.
+# count prints the number of slots occupied by this model in this local home group.
 # A slot is occupied by a provably local Firstmate-owned worker whose recorded
 # model matches and whose endpoint is alive, or whose endpoint is ambiguous,
 # unreadable, or unverified (those are not free slots). A worker whose
@@ -19,8 +19,8 @@
 # is not local and does not occupy a slot.
 # An unreadable, symlinked, or otherwise unclassifiable task record or claim
 # makes the whole count unknown. Unknown never counts as a free slot.
-# Workers outside this home, and any session that is not a Firstmate task
-# record in this home, are not counted. Every result says so.
+# Workers outside registered local secondmate homes, and sessions that are not
+# Firstmate task records, are not counted. Every result says so.
 #
 # admit writes a claim under the home's capacity lock so two spawns cannot
 # both observe the same free slot. The claim occupies a slot while its pid
@@ -76,8 +76,16 @@ CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 CLAIM_DIR="$STATE/local-capacity.d"
 LOCK="$STATE/.local-capacity.lock"
 GRACE=30
-DISCLOSURE='non-Firstmate sessions on the local server are not counted, and workers outside this home are not counted'
+DISCLOSURE='non-Firstmate sessions on the local server are not counted; registered local homes only'
 LOCK_HELD=0
+
+if [ -f "$FM_HOME/.fm-secondmate-parent" ] && [ ! -L "$FM_HOME/.fm-secondmate-parent" ]; then
+  # shellcheck source=bin/fm-secondmate-parent-lib.sh
+  . "$SCRIPT_DIR/fm-secondmate-parent-lib.sh"
+  if fm_secondmate_parent_record_parse "$FM_HOME/.fm-secondmate-parent" && [ "$FM_SECONDMATE_PARENT_ROUTE" = local ]; then
+    LOCK="$FM_SECONDMATE_PARENT_HOME/state/.local-capacity.lock"
+  fi
+fi
 
 die() { printf 'error: %s\n' "$1" >&2; exit 2; }
 usage() {
@@ -140,6 +148,8 @@ endpoint_class() { # <meta>
 cap_collect() {
   local model=$1 except=${2:-} meta base id remote recorded class claim rest
   local claim_model claim_pid mtime now age via state
+  local home parent_home parent_path registry_line
+  local home_list="$FM_HOME" original_state=$STATE original_claim_dir=$CLAIM_DIR
   CAP_STATUS=known
   CAP_ACTIVE=0
   CAP_REASON='-'
@@ -147,18 +157,65 @@ cap_collect() {
   now=$(date +%s) || { CAP_STATUS=unknown; CAP_REASON='clock unreadable'; return 0; }
 
   add_occupant() { # id via state
-    local id=$1 via=$2 state=$3 row
-    row="$id|$via|$state"
+    local id=$1 via=$2 state=$3 row identity
+    identity="$STATE/$id"
+    row="$id|$via|$state|$identity"
     case "
 $CAP_OCCUPANTS
 " in
-      *"
-$id|"*) return 0 ;;
+      *"|$identity
+"*) return 0 ;;
     esac
     CAP_OCCUPANTS="${CAP_OCCUPANTS:+$CAP_OCCUPANTS
 }$row"
   }
 
+  if [ -e "$FM_HOME/.fm-secondmate-parent" ] || [ -L "$FM_HOME/.fm-secondmate-parent" ]; then
+    # shellcheck source=bin/fm-secondmate-parent-lib.sh
+    . "$SCRIPT_DIR/fm-secondmate-parent-lib.sh"
+    if [ -f "$FM_HOME/.fm-secondmate-parent" ] && [ ! -L "$FM_HOME/.fm-secondmate-parent" ] &&
+      fm_secondmate_parent_record_parse "$FM_HOME/.fm-secondmate-parent" && [ "$FM_SECONDMATE_PARENT_ROUTE" = local ]; then
+      parent_path=$(cd "$FM_SECONDMATE_PARENT_HOME" 2>/dev/null && pwd -P) || parent_path=''
+      [ -n "$parent_path" ] || { CAP_STATUS=unknown; CAP_REASON='local parent home is unavailable'; return 0; }
+      home_list=$parent_path
+    else
+      CAP_STATUS=unknown; CAP_REASON='local parent binding is unreadable'; return 0
+    fi
+  fi
+  if [ -e "$home_list/data/secondmates.md" ] || [ -L "$home_list/data/secondmates.md" ]; then
+    if [ ! -f "$home_list/data/secondmates.md" ] || [ -L "$home_list/data/secondmates.md" ] || [ ! -r "$home_list/data/secondmates.md" ]; then
+      CAP_STATUS=unknown; CAP_REASON='secondmate registry is unreadable'; return 0
+    fi
+    # shellcheck source=bin/fm-secondmate-registry-lib.sh
+    . "$SCRIPT_DIR/fm-secondmate-registry-lib.sh"
+    while IFS= read -r registry_line || [ -n "$registry_line" ]; do
+      case "$registry_line" in '- '*)
+        if ! secondmate_registry_parse_line "$registry_line"; then
+          CAP_STATUS=unknown; CAP_REASON='secondmate registry has a malformed entry'; return 0
+        fi
+        [ "$SECONDMATE_REGISTRY_REMOTE" -eq 0 ] || continue
+        home=$SECONDMATE_REGISTRY_HOME
+        [ -d "$home" ] && [ -f "$home/.fm-secondmate-home" ] && [ ! -L "$home/.fm-secondmate-home" ] || {
+          CAP_STATUS=unknown; CAP_REASON='registered local home is unavailable'; return 0;
+        }
+        [ "$(cat "$home/.fm-secondmate-home" 2>/dev/null || true)" = "$SECONDMATE_REGISTRY_ID" ] || {
+          CAP_STATUS=unknown; CAP_REASON='registered local home identity is ambiguous'; return 0;
+        }
+        parent_path=$(cd "$home_list" 2>/dev/null && pwd -P) || parent_path=''
+        home=$(cd "$home" 2>/dev/null && pwd -P) || home=''
+        [ -n "$home" ] && [ "$home" != "$parent_path" ] || {
+          CAP_STATUS=unknown; CAP_REASON='registered local home path is ambiguous'; return 0;
+        }
+        case "\n$home_list\n" in *"\n$home\n"*) ;; *) home_list="$home_list
+$home" ;; esac
+        ;;
+      esac
+    done < "$home_list/data/secondmates.md"
+  fi
+
+  while IFS= read -r home; do
+  STATE="$home/state"
+  CLAIM_DIR="$STATE/local-capacity.d"
   for meta in "$STATE"/*.meta; do
     [ -e "$meta" ] || [ -L "$meta" ] || continue
     base=$(basename "$meta")
@@ -175,7 +232,7 @@ $id|"*) return 0 ;;
       CAP_REASON="task record $base is not a task id"
       return 0
     }
-    [ "$id" = "$except" ] && continue
+    [ "$home" = "$FM_HOME" ] && [ "$id" = "$except" ] && continue
     recorded=$(fm_meta_get "$meta" model)
     [ "$recorded" = "$model" ] || continue
     remote=$(fm_meta_get "$meta" remote_host)
@@ -204,7 +261,7 @@ $id|"*) return 0 ;;
         CAP_REASON="capacity claim $id is not a task id"
         return 0
       }
-      [ "$id" = "$except" ] && continue
+      [ "$home" = "$FM_HOME" ] && [ "$id" = "$except" ] && continue
       claim_model=''
       claim_pid=''
       while IFS= read -r rest || [ -n "$rest" ]; do
@@ -263,12 +320,17 @@ $id|"*) return 0 ;;
       fi
     done
   fi
+  done <<EOF_CAPACITY_HOMES
+$home_list
+EOF_CAPACITY_HOMES
 
   if [ -n "$CAP_OCCUPANTS" ]; then
     CAP_ACTIVE=$(printf '%s\n' "$CAP_OCCUPANTS" | awk 'NF { n++ } END { print n+0 }')
   else
     CAP_ACTIVE=0
   fi
+  STATE=$original_state
+  CLAIM_DIR=$original_claim_dir
 }
 
 emit() { # status active model task reason
@@ -280,7 +342,7 @@ emit() { # status active model task reason
   printf '  reason: %s\n' "$5"
   printf '  disclosure: %s\n' "$DISCLOSURE"
   if [ -n "$CAP_OCCUPANTS" ]; then
-    printf '%s\n' "$CAP_OCCUPANTS" | while IFS='|' read -r id via state; do
+    printf '%s\n' "$CAP_OCCUPANTS" | while IFS='|' read -r id via state identity; do
       [ -n "$id" ] || continue
       printf '  occupant: %s via=%s state=%s\n' "$id" "$via" "$state"
     done
